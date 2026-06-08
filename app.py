@@ -340,8 +340,9 @@ def apply_aging_texture(img_np, age, direction):
 
     # ─── SKIN MASK DETECTION ───
     hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-    mask1 = cv2.inRange(hsv, np.array([0, 15, 40]), np.array([25, 255, 255]))
-    mask2 = cv2.inRange(hsv, np.array([165, 15, 40]), np.array([180, 255, 255]))
+    # Broadened threshold to capture skin under any lighting/shadows
+    mask1 = cv2.inRange(hsv, np.array([0, 10, 30]), np.array([30, 255, 255]))
+    mask2 = cv2.inRange(hsv, np.array([160, 10, 30]), np.array([180, 255, 255]))
     skin_mask = cv2.bitwise_or(mask1, mask2)
 
     # Center-focused radial mask to target face and ignore background skin-tones
@@ -349,8 +350,10 @@ def apply_aging_texture(img_np, age, direction):
     yc, xc = h / 2.0, w / 2.0
     radial_mask = np.clip(1.0 - np.sqrt((Y - yc)**2 / (h/2.0)**2 + (X - xc)**2 / (w/2.0)**2), 0, 1)
 
-    # Combined face-skin mask
-    skin_mask_f = (skin_mask.astype(np.float32) / 255.0) * radial_mask
+    # Combined face-skin mask: Blend skin detection (70%) and radial center (30%)
+    # to guarantee a soft fallback face area, then suppress background using radial_mask.
+    skin_mask_f = (skin_mask.astype(np.float32) / 255.0) * 0.7 + radial_mask * 0.3
+    skin_mask_f = skin_mask_f * radial_mask
 
     # Adaptive smoothing kernel based on image size
     ksize = int(min(h, w) * 0.05) | 1
@@ -359,8 +362,13 @@ def apply_aging_texture(img_np, age, direction):
         ksize += 1
 
     face_mask = cv2.GaussianBlur(skin_mask_f, (ksize, ksize), 0)
-    if face_mask.max() < 0.1:
-        face_mask = cv2.GaussianBlur(radial_mask, (ksize, ksize), 0)
+    
+    # Normalize mask to ensure the maximum face mask intensity is exactly 1.0
+    max_val = face_mask.max()
+    if max_val > 0.01:
+        face_mask = face_mask / max_val
+    else:
+        face_mask = radial_mask
 
     face_mask = np.expand_dims(np.clip(face_mask, 0, 1), axis=2)
 
@@ -369,8 +377,8 @@ def apply_aging_texture(img_np, age, direction):
 
         # 1. Exaggerate natural face creases (wrinkles)
         gray_img = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-        blurred_gray = cv2.GaussianBlur(gray_img, (5, 5), 0)
-        bilateral = cv2.bilateralFilter(blurred_gray, 9, 50, 50)
+        blurred_gray = cv2.GaussianBlur(gray_img, (3, 3), 0)
+        bilateral = cv2.bilateralFilter(blurred_gray, 7, 30, 30)
         edges = cv2.Laplacian(bilateral, cv2.CV_32F, ksize=3)
         edges = np.absolute(edges)
         if edges.max() > 0:
@@ -380,37 +388,55 @@ def apply_aging_texture(img_np, age, direction):
 
         kernel = np.ones((2, 2), np.uint8)
         edges = cv2.dilate(edges, kernel, iterations=1)
-        edges_blur = cv2.GaussianBlur(edges, (5, 5), 0)
+        edges_blur = cv2.GaussianBlur(edges, (3, 3), 0)
         wrinkle_mask = np.expand_dims(edges_blur, axis=2)
 
-        # Darken the natural lines on the face skin
-        wrinkles = wrinkle_mask * face_mask * intensity * 0.28
+        # Darken the natural lines on the face skin (increased strength to 0.58)
+        wrinkles = wrinkle_mask * face_mask * intensity * 0.58
         img = img * (1.0 - wrinkles)
 
-        # 2. Add fine-grained skin micro-textures
+        # 2. Add fine-grained skin micro-textures (increased noise to 0.045)
         rng = np.random.RandomState(42)
-        noise_fine = rng.randn(h, w, 1).astype(np.float32) * 0.015 * intensity
+        noise_fine = rng.randn(h, w, 1).astype(np.float32) * 0.045 * intensity
         img += noise_fine * face_mask
 
-        # 3. Desaturate the skin
+        # 3. Desaturate the skin (increased to 0.52 for aging paleness)
         gray = 0.299 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 2]
         gray_3ch = np.stack([gray] * 3, axis=-1)
-        img = img * (1.0 - face_mask * intensity * 0.35) + gray_3ch * (face_mask * intensity * 0.35)
+        img = img * (1.0 - face_mask * intensity * 0.52) + gray_3ch * (face_mask * intensity * 0.52)
 
         # 4. Color shift: older skin loses redness and becomes warmer/paler
-        img[:, :, 0] -= 0.04 * intensity * face_mask[:, :, 0]
-        img[:, :, 2] -= 0.04 * intensity * face_mask[:, :, 0]
+        img[:, :, 0] -= 0.05 * intensity * face_mask[:, :, 0] # reduce red
+        img[:, :, 1] -= 0.02 * intensity * face_mask[:, :, 0] # reduce green slightly
+        img[:, :, 2] -= 0.08 * intensity * face_mask[:, :, 0] # reduce blue (increases yellowing)
 
         # 5. Soft Eye Bags band (vertical Gaussian centered at 42% height)
+        # Apply a colored purple-brown shadow under the eyes
         eye_y = h * 0.42
-        eye_band = np.exp(-((Y - eye_y) / (h * 0.06))**2)
-        eye_x_mask = np.exp(-((X - w*0.5) / (w * 0.22))**2)
+        eye_band = np.exp(-((Y - eye_y) / (h * 0.07))**2)
+        eye_x_mask = np.exp(-((X - w*0.5) / (w * 0.25))**2)
         eye_mask = np.expand_dims(eye_band * eye_x_mask, axis=2) * face_mask
-        img = img * (1.0 - eye_mask * intensity * 0.16)
+        
+        img[:, :, 0] -= eye_mask[:, :, 0] * 0.08 * intensity # red
+        img[:, :, 1] -= eye_mask[:, :, 0] * 0.18 * intensity # green (reduces green the most to make it purple)
+        img[:, :, 2] -= eye_mask[:, :, 0] * 0.14 * intensity # blue
 
-        # 6. Sagging shadows on lower face skin
-        sag = np.linspace(0, intensity * 0.08, h)[:, None, None]
+        # 6. Sagging shadows on lower face skin (increased strength to 0.15)
+        sag = np.linspace(0, intensity * 0.15, h)[:, None, None]
         img -= sag * face_mask
+
+        # 7. Add random age spots (pigmentation)
+        spot_rng = np.random.RandomState(101)
+        sh, sw = int(h / 16), int(w / 16)
+        spots_low = spot_rng.rand(sh, sw).astype(np.float32)
+        spots_mask = (spots_low > 0.94).astype(np.float32)
+        spots_high = cv2.resize(spots_mask, (w, h), interpolation=cv2.INTER_CUBIC)
+        spots_high = cv2.GaussianBlur(spots_high, (21, 21), 0)
+        spots_high = np.expand_dims(spots_high, axis=2) * face_mask
+        
+        img[:, :, 0] -= spots_high[:, :, 0] * 0.15 * intensity
+        img[:, :, 1] -= spots_high[:, :, 0] * 0.28 * intensity
+        img[:, :, 2] -= spots_high[:, :, 0] * 0.42 * intensity
 
         img = np.clip(img, 0, 1)
     else:
@@ -418,15 +444,15 @@ def apply_aging_texture(img_np, age, direction):
 
         # 1. Bilateral skin smoothing (removes blemishes while preserving sharp boundaries like eyes/lips)
         img_uint8 = (img * 255.0).astype(np.uint8)
-        smoothed = cv2.bilateralFilter(img_uint8, 15, 30, 30).astype(np.float32) / 255.0
-        img = img * (1.0 - face_mask * intensity * 0.75) + smoothed * (face_mask * intensity * 0.75)
+        smoothed = cv2.bilateralFilter(img_uint8, 15, 50, 50).astype(np.float32) / 255.0
+        img = img * (1.0 - face_mask * intensity * 0.85) + smoothed * (face_mask * intensity * 0.85)
 
         # 2. Youthful flush: boost red and green channels slightly on skin
-        img[:, :, 0] += 0.06 * intensity * face_mask[:, :, 0]
-        img[:, :, 1] += 0.02 * intensity * face_mask[:, :, 0]
+        img[:, :, 0] += 0.08 * intensity * face_mask[:, :, 0]
+        img[:, :, 1] += 0.03 * intensity * face_mask[:, :, 0]
 
         # 3. Overall subtle skin brightness boost
-        img += 0.04 * intensity * face_mask
+        img += 0.05 * intensity * face_mask
 
         img = np.clip(img, 0, 1)
 
