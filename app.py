@@ -338,34 +338,97 @@ def apply_aging_texture(img_np, age, direction):
     img = img_np.copy().astype(np.float32)/255.0
     h,w = img.shape[:2]
 
+    # ─── SKIN MASK DETECTION ───
+    hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+    mask1 = cv2.inRange(hsv, np.array([0, 15, 40]), np.array([25, 255, 255]))
+    mask2 = cv2.inRange(hsv, np.array([165, 15, 40]), np.array([180, 255, 255]))
+    skin_mask = cv2.bitwise_or(mask1, mask2)
+
+    # Center-focused radial mask to target face and ignore background skin-tones
+    Y, X = np.ogrid[:h, :w]
+    yc, xc = h / 2.0, w / 2.0
+    radial_mask = np.clip(1.0 - np.sqrt((Y - yc)**2 / (h/2.0)**2 + (X - xc)**2 / (w/2.0)**2), 0, 1)
+
+    # Combined face-skin mask
+    skin_mask_f = (skin_mask.astype(np.float32) / 255.0) * radial_mask
+
+    # Adaptive smoothing kernel based on image size
+    ksize = int(min(h, w) * 0.05) | 1
+    ksize = max(5, ksize)
+    if ksize % 2 == 0:
+        ksize += 1
+
+    face_mask = cv2.GaussianBlur(skin_mask_f, (ksize, ksize), 0)
+    if face_mask.max() < 0.1:
+        face_mask = cv2.GaussianBlur(radial_mask, (ksize, ksize), 0)
+
+    face_mask = np.expand_dims(np.clip(face_mask, 0, 1), axis=2)
+
     if direction=="age":
         intensity = np.clip((age-30)/70.0,0,1)
+
+        # 1. Exaggerate natural face creases (wrinkles)
+        gray_img = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+        blurred_gray = cv2.GaussianBlur(gray_img, (5, 5), 0)
+        bilateral = cv2.bilateralFilter(blurred_gray, 9, 50, 50)
+        edges = cv2.Laplacian(bilateral, cv2.CV_32F, ksize=3)
+        edges = np.absolute(edges)
+        if edges.max() > 0:
+            edges = np.clip(edges / (edges.max() + 1e-5), 0, 1)
+        else:
+            edges = np.zeros_like(edges)
+
+        kernel = np.ones((2, 2), np.uint8)
+        edges = cv2.dilate(edges, kernel, iterations=1)
+        edges_blur = cv2.GaussianBlur(edges, (5, 5), 0)
+        wrinkle_mask = np.expand_dims(edges_blur, axis=2)
+
+        # Darken the natural lines on the face skin
+        wrinkles = wrinkle_mask * face_mask * intensity * 0.28
+        img = img * (1.0 - wrinkles)
+
+        # 2. Add fine-grained skin micro-textures
         rng = np.random.RandomState(42)
-        noise_fine  = rng.randn(h,w).astype(np.float32)*0.012*intensity
-        noise_coarse= np.random.RandomState(7).randn(h,w).astype(np.float32)*0.008*intensity
-        noise = noise_fine+noise_coarse
-        img[:,:,0]+=noise; img[:,:,1]+=noise*0.9; img[:,:,2]+=noise*0.8
-        gray = 0.299*img[:,:,0]+0.587*img[:,:,1]+0.114*img[:,:,2]
-        img[:,:,0]=img[:,:,0]*(1-intensity*0.45)+gray*intensity*0.45
-        img[:,:,1]=img[:,:,1]*(1-intensity*0.45)+gray*intensity*0.45
-        img[:,:,2]=img[:,:,2]*(1-intensity*0.45)+gray*intensity*0.45
-        img[:,:,2]*=(1-intensity*0.08)
-        sag=np.linspace(0,intensity*0.06,h)[:,None,None]
-        img-=sag*np.ones((1,w,3))
-        yc,xc=int(h*0.42),int(w*0.5)
-        for dx in [-int(w*0.13),int(w*0.13)]:
-            Y,X=np.ogrid[:h,:w]
-            mask=((Y-yc)**2/200+(X-xc-dx)**2/300)<1
-            img[mask]*=(1-intensity*0.12)
-        img*=(1-intensity*0.07)
+        noise_fine = rng.randn(h, w, 1).astype(np.float32) * 0.015 * intensity
+        img += noise_fine * face_mask
+
+        # 3. Desaturate the skin
+        gray = 0.299 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 2]
+        gray_3ch = np.stack([gray] * 3, axis=-1)
+        img = img * (1.0 - face_mask * intensity * 0.35) + gray_3ch * (face_mask * intensity * 0.35)
+
+        # 4. Color shift: older skin loses redness and becomes warmer/paler
+        img[:, :, 0] -= 0.04 * intensity * face_mask[:, :, 0]
+        img[:, :, 2] -= 0.04 * intensity * face_mask[:, :, 0]
+
+        # 5. Soft Eye Bags band (vertical Gaussian centered at 42% height)
+        eye_y = h * 0.42
+        eye_band = np.exp(-((Y - eye_y) / (h * 0.06))**2)
+        eye_x_mask = np.exp(-((X - w*0.5) / (w * 0.22))**2)
+        eye_mask = np.expand_dims(eye_band * eye_x_mask, axis=2) * face_mask
+        img = img * (1.0 - eye_mask * intensity * 0.16)
+
+        # 6. Sagging shadows on lower face skin
+        sag = np.linspace(0, intensity * 0.08, h)[:, None, None]
+        img -= sag * face_mask
+
+        img = np.clip(img, 0, 1)
     else:
-        intensity=np.clip((30-age)/30.0,0,1)
-        pil_tmp=Image.fromarray((img*255).astype(np.uint8))
-        pil_tmp=pil_tmp.filter(ImageFilter.GaussianBlur(radius=intensity*1.2))
-        img=np.array(pil_tmp).astype(np.float32)/255.0
-        img[:,:,0]=np.clip(img[:,:,0]*(1+intensity*0.18),0,1)
-        img[:,:,1]=np.clip(img[:,:,1]*(1+intensity*0.12),0,1)
-        img=np.clip(img*(1+intensity*0.06),0,1)
+        intensity = np.clip((30-age)/30.0, 0, 1)
+
+        # 1. Bilateral skin smoothing (removes blemishes while preserving sharp boundaries like eyes/lips)
+        img_uint8 = (img * 255.0).astype(np.uint8)
+        smoothed = cv2.bilateralFilter(img_uint8, 15, 30, 30).astype(np.float32) / 255.0
+        img = img * (1.0 - face_mask * intensity * 0.75) + smoothed * (face_mask * intensity * 0.75)
+
+        # 2. Youthful flush: boost red and green channels slightly on skin
+        img[:, :, 0] += 0.06 * intensity * face_mask[:, :, 0]
+        img[:, :, 1] += 0.02 * intensity * face_mask[:, :, 0]
+
+        # 3. Overall subtle skin brightness boost
+        img += 0.04 * intensity * face_mask
+
+        img = np.clip(img, 0, 1)
 
     return np.clip(img*255,0,255).astype(np.uint8)
 
@@ -378,7 +441,17 @@ def run_gan_inference(model, pil_img, source_age, target_age):
     gan_out = tensor_to_pil(out).resize(pil_img.size, Image.LANCZOS)
     gan_np  = np.array(gan_out)
     src_np  = np.array(pil_img)
-    blended = (src_np*0.85+gan_np*0.15).astype(np.uint8)
+
+    # Extract high-frequency style details from the GAN output to avoid random color blobs
+    gan_gray = cv2.cvtColor(gan_np, cv2.COLOR_RGB2GRAY)
+    gan_gray_3ch = np.stack([gan_gray]*3, axis=-1)
+    gan_blur = cv2.GaussianBlur(gan_gray_3ch, (21, 21), 0)
+    highpass = gan_gray_3ch.astype(np.float32) - gan_blur.astype(np.float32)
+
+    # Blend a subtle 4% of the GAN fine details to retain styling without disfiguring blobs
+    blended = src_np.astype(np.float32) + highpass * 0.04
+    blended = np.clip(blended, 0, 255).astype(np.uint8)
+
     direction = "age" if target_age>source_age else "deage"
     result = apply_aging_texture(blended, target_age, direction)
     return Image.fromarray(result)
