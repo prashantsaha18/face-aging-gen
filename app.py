@@ -377,7 +377,7 @@ def run_gan_inference(model, pil_img, source_age, target_age):
         out = model(tensor, age_cls)
     gan_out = tensor_to_pil(out).resize(pil_img.size, Image.LANCZOS)
     gan_np  = np.array(gan_out)
-    src_np  = np.array(pil_img.resize((256,256),Image.LANCZOS))
+    src_np  = np.array(pil_img)
     blended = (src_np*0.85+gan_np*0.15).astype(np.uint8)
     direction = "age" if target_age>source_age else "deage"
     result = apply_aging_texture(blended, target_age, direction)
